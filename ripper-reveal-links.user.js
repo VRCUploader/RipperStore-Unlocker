@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         RipperStore Link Revealer
-// @namespace    ripper.store.research
-// @version      1.3.0
+// @namespace    https://forum.ripper.store
+// @version      1.3.1
 // @description  Reveals guest-hidden links and uploaded media on RipperStore topics.
-// @author       research
+// @author       VRCUploader Team
 // @match        https://forum.ripper.store/*
+// @downloadURL  https://raw.githubusercontent.com/VRCUploader/ripper-store-links-revealer/main/ripper-reveal-links.user.js
+// @updateURL    https://raw.githubusercontent.com/VRCUploader/ripper-store-links-revealer/main/ripper-reveal-links.user.js
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -23,6 +25,7 @@
   let revealInProgress = false;
   let revealTimer;
   let toastTimer;
+  let revealedTotals = { links: 0, media: 0, posts: 0 };
 
   function addStyles() {
     if (document.querySelector('#rs-reveal-styles')) return;
@@ -114,13 +117,14 @@
     toastTimer = setTimeout(() => toast.classList.remove('is-visible'), 2800);
   }
 
-  function createLink(url, text = url) {
+  function createLink(url, text = url, title = 'Revealed hidden link') {
     const link = document.createElement('a');
     link.className = 'rs-revealed-link';
     link.href = url;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
     link.textContent = text;
+    link.title = title;
     return link;
   }
 
@@ -174,12 +178,13 @@
         image.src = url;
         image.alt = 'Revealed media';
         image.loading = 'lazy';
+        image.title = 'Revealed from the public upload URL';
 
-        const link = createLink(url, '');
+        const link = createLink(url, '', 'Open revealed media');
         link.append(image);
         wrapper.replaceWith(link);
       } else {
-        wrapper.replaceWith(createLink(url));
+        wrapper.replaceWith(createLink(url, url, 'Revealed from the public upload URL'));
       }
 
       revealedCount++;
@@ -254,18 +259,19 @@
     });
   }
 
-  function replaceHiddenLinks(postContent, urls) {
+  function replaceHiddenLinks(postContent, urls, postId) {
     const placeholders = [...postContent.querySelectorAll(HIDDEN_LINK)];
     const replacementCount = Math.min(placeholders.length, urls.length);
+    const title = `Revealed via ${API_POSTS}/${postId}`;
 
     for (let index = 0; index < replacementCount; index++) {
-      placeholders[index].replaceWith(createLink(urls[index]));
+      placeholders[index].replaceWith(createLink(urls[index], urls[index], title));
     }
 
-    appendExtraLinks(postContent, urls.slice(replacementCount));
+    appendExtraLinks(postContent, urls.slice(replacementCount), title);
   }
 
-  function appendExtraLinks(postContent, urls) {
+  function appendExtraLinks(postContent, urls, title) {
     if (!urls.length || postContent.querySelector('.rs-extra-links')) return;
 
     const container = document.createElement('div');
@@ -276,7 +282,7 @@
     container.append(heading);
 
     for (const url of urls) {
-      container.append(document.createElement('br'), createLink(url));
+      container.append(document.createElement('br'), createLink(url, url, title));
     }
 
     postContent.append(container);
@@ -304,7 +310,7 @@
         const postContent = getPostContent(post);
         const urls = hiddenUrls(rawContent, postContent);
 
-        replaceHiddenLinks(postContent, urls);
+        replaceHiddenLinks(postContent, urls, postId);
         post.setAttribute(REVEALED, '');
         if (urls.length) postCount++;
         linkCount += urls.length;
@@ -316,27 +322,67 @@
     return { postCount, linkCount };
   }
 
-  function resultMessage(mediaCount, postCount, linkCount) {
-    const parts = [];
-    if (mediaCount) parts.push(`${mediaCount} media item(s)`);
-    if (linkCount) parts.push(`${linkCount} link(s) in ${postCount} post(s)`);
-    return parts.length ? `Revealed ${parts.join(', ')}` : 'Nothing to reveal on this page';
+  function countLabel(count, singular, plural = `${singular}s`) {
+    return `${count} ${count === 1 ? singular : plural}`;
   }
 
-  async function revealAll() {
+  function resultMessage(mediaCount, postCount, linkCount) {
+    const parts = [];
+    if (mediaCount) parts.push(countLabel(mediaCount, 'media item'));
+    if (linkCount) {
+      parts.push(
+        `${countLabel(linkCount, 'link')} in ${countLabel(postCount, 'post')}`
+      );
+    }
+    return `Revealed ${parts.join(', ')}`;
+  }
+
+  function updateButton(button) {
+    const totalItems = revealedTotals.links + revealedTotals.media;
+    if (!totalItems) {
+      button.textContent = 'Reveal hidden content';
+      button.title = 'Reveal links and media hidden from guests';
+      return;
+    }
+
+    button.textContent = `${countLabel(totalItems, 'item')} revealed`;
+    button.title = resultMessage(
+      revealedTotals.media,
+      revealedTotals.posts,
+      revealedTotals.links
+    );
+  }
+
+  async function revealAll({ notifyIfEmpty = true } = {}) {
     if (revealInProgress) return;
     revealInProgress = true;
 
     const button = document.querySelector('.rs-reveal-button');
-    if (button) button.disabled = true;
+    if (button) {
+      button.disabled = true;
+      button.textContent = 'Revealing...';
+    }
 
     try {
       const mediaCount = revealLockedMedia();
       const { postCount, linkCount } = await revealGuestLinks();
-      showToast(resultMessage(mediaCount, postCount, linkCount));
+
+      if (mediaCount || linkCount) {
+        revealedTotals.media += mediaCount;
+        revealedTotals.links += linkCount;
+        revealedTotals.posts += postCount;
+        showToast(resultMessage(mediaCount, postCount, linkCount));
+      } else if (notifyIfEmpty && (revealedTotals.media || revealedTotals.links)) {
+        showToast('Everything on this page is already revealed');
+      } else if (notifyIfEmpty) {
+        showToast('No hidden content found on this page');
+      }
     } finally {
       revealInProgress = false;
-      if (button) button.disabled = false;
+      if (button) {
+        button.disabled = false;
+        updateButton(button);
+      }
     }
   }
 
@@ -350,7 +396,9 @@
   function scheduleReveal() {
     if (!needsReveal()) return;
     clearTimeout(revealTimer);
-    revealTimer = setTimeout(revealAll, 350);
+    revealTimer = setTimeout(() => {
+      if (needsReveal()) revealAll({ notifyIfEmpty: false });
+    }, 350);
   }
 
   function addRevealButton() {
@@ -359,15 +407,17 @@
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'rs-reveal-button';
-    button.textContent = 'Reveal locked';
-    button.title = 'Reveal guest-hidden links and uploaded media';
-    button.addEventListener('click', revealAll);
+    button.addEventListener('click', () => revealAll());
+    updateButton(button);
     document.body.append(button);
   }
 
   function handleNavigation() {
     rawPostCache.clear();
+    revealedTotals = { links: 0, media: 0, posts: 0 };
     addRevealButton();
+    const button = document.querySelector('.rs-reveal-button');
+    if (button) updateButton(button);
     scheduleReveal();
   }
 
