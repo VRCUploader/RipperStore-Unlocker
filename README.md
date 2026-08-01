@@ -18,3 +18,14 @@ Today, the forum exists as one of the largest centralized repositories of leaked
 ## Usage
 
 Once installed you can now search posts on ripper.store and view links without an account
+
+## Previews
+### New Buttons
+<img width="1903" height="958" alt="Screenshot_20260801_173825" src="https://github.com/user-attachments/assets/c03c861b-92e0-4136-9040-7ecfe922c5e0" />
+
+### Search
+<img width="1903" height="958" alt="Screenshot_20260801_174039" src="https://github.com/user-attachments/assets/67d52927-848d-4050-93ac-6947516e667f" />
+
+### Unlock
+<img width="1903" height="958" alt="Screenshot_20260801_174049" src="https://github.com/user-attachments/assets/ddf00805-18c7-41e4-b94f-0db96e2ec918" />
+
