@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RipperStore Unlocker
 // @namespace    https://forum.ripper.store
-// @version      2.4.0
+// @version      2.5.0
 // @description  Unlocks guest-hidden content and provides private local topic search.
 // @author       VRCUploader Team
 // @match        https://forum.ripper.store/*
@@ -32,12 +32,22 @@
   const STATS_REFRESH_INTERVAL = 24 * 60 * 60 * 1000;
   const RECENT_SITEMAP_COUNT = 8;
   const RECENT_FEED_PAGES = 10;
-  const SUPPLEMENT_CATEGORY_IDS = [44];
-  const SUPPLEMENT_CATEGORY_PAGES = 2;
+  const FEED_PAGE_SIZE = 20;
+  const EXTRA_FEED_CATEGORIES = [{ id: 44, name: 'Gifts/Downloads' }];
+  const CATEGORY_FEED_PAGES = 2;
   const FETCH_CONCURRENCY = 4;
   const FETCH_TIMEOUT = 20_000;
   const FETCH_ATTEMPTS = 3;
   const RESULT_PAGE_SIZE = 50;
+
+  // longest first, so the largest unit that fits is the one reported
+  const TIME_UNITS = [
+    ['year', 365 * 24 * 60 * 60],
+    ['month', 30 * 24 * 60 * 60],
+    ['day', 24 * 60 * 60],
+    ['hour', 60 * 60],
+    ['minute', 60],
+  ];
 
   const rawPostCache = new Map();
   let revealInProgress = false;
@@ -51,282 +61,209 @@
     updating: false,
     updateTimer: null,
     sortMode: 'relevance',
+    sortDirection: 'descending',
     allResults: [],
     resultScores: new Map(),
     displayLimit: RESULT_PAGE_SIZE,
     indexStatus: '',
-    supplementing: false,
+    newestTopicsRun: null,
   };
+
+  function el(tag, properties = {}, ...children) {
+    const node = Object.assign(document.createElement(tag), properties);
+    node.append(...children);
+    return node;
+  }
 
   function addStyles() {
     if (document.querySelector('#rs-reveal-styles')) return;
 
-    const style = document.createElement('style');
-    style.id = 'rs-reveal-styles';
-    style.textContent = `
-      .rs-toolbox {
-        position: fixed;
-        right: 16px;
-        bottom: 16px;
-        z-index: 99999;
-        display: flex;
-        flex-direction: column;
-        align-items: flex-end;
-        gap: 8px;
-      }
+    document.head.append(el('style', {
+      id: 'rs-reveal-styles',
+      textContent: `
+        .rs-toolbox {
+          position: fixed;
+          right: 16px;
+          bottom: 16px;
+          z-index: 99999;
+          display: flex;
+          flex-direction: column;
+          align-items: flex-end;
+          gap: 8px;
+        }
+        .rs-toolbox-button {
+          padding: 8px 12px;
+          border: 0;
+          border-radius: 8px;
+          box-shadow: 0 4px 14px rgb(0 0 0 / 25%);
+          color: #fff;
+          font: 600 13px/1.2 system-ui, sans-serif;
+          cursor: pointer;
+        }
+        .rs-toolbox-button:hover { filter: brightness(1.08); }
+        .rs-toolbox-button:disabled { opacity: .6; cursor: wait; }
+        .rs-reveal-button { background: #198754; }
+        .rs-search-open { background: #0d6efd; }
 
-      .rs-revealed-link {
-        color: #0d6efd !important;
-        text-decoration: underline !important;
-        overflow-wrap: anywhere;
-      }
+        .rs-revealed-link {
+          color: #0d6efd !important;
+          text-decoration: underline !important;
+          overflow-wrap: anywhere;
+        }
+        .rs-revealed-image {
+          display: block;
+          max-width: 100%;
+          height: auto;
+          margin: .35rem 0;
+          border-radius: 4px;
+        }
+        .rs-extra-links {
+          margin: .35rem 0;
+          padding: .4rem .55rem;
+          border-left: 3px solid #198754;
+          border-radius: 0 4px 4px 0;
+          background: rgb(25 135 84 / 8%);
+          font-size: .9em;
+        }
 
-      .rs-revealed-image {
-        display: block;
-        max-width: 100%;
-        height: auto;
-        margin: .35rem 0;
-        border-radius: 4px;
-      }
+        .rs-reveal-toast {
+          position: absolute;
+          right: 0;
+          bottom: calc(100% + 8px);
+          max-width: 320px;
+          width: max-content;
+          padding: 8px 12px;
+          border-radius: 8px;
+          background: #212529;
+          color: #fff;
+          font: 12px/1.35 system-ui, sans-serif;
+          opacity: 0;
+          transition: opacity .2s;
+          pointer-events: none;
+        }
+        .rs-reveal-toast.is-visible { opacity: .95; }
 
-      .rs-extra-links {
-        margin: .35rem 0;
-        padding: .4rem .55rem;
-        border-left: 3px solid #198754;
-        border-radius: 0 4px 4px 0;
-        background: rgb(25 135 84 / 8%);
-        font-size: .9em;
-      }
+        .rs-search-dialog {
+          position: fixed;
+          inset: 0;
+          z-index: 100000;
+          display: none;
+          align-items: flex-start;
+          justify-content: center;
+          padding: 8vh 16px 16px;
+          background: rgb(0 0 0 / 55%);
+        }
+        .rs-search-dialog.is-open { display: flex; }
+        .rs-search-panel {
+          display: flex;
+          flex-direction: column;
+          width: min(720px, 100%);
+          max-height: 84vh;
+          overflow: hidden;
+          border-radius: 10px;
+          background: var(--bs-body-bg, #fff);
+          box-shadow: 0 12px 40px rgb(0 0 0 / 35%);
+          color: var(--bs-body-color, #212529);
+        }
+        .rs-search-panel header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 14px 16px 8px;
+        }
+        .rs-search-panel h2 { margin: 0; font-size: 1.2rem; }
 
-      .rs-toolbox-button {
-        padding: 8px 12px;
-        border: 0;
-        border-radius: 8px;
-        box-shadow: 0 4px 14px rgb(0 0 0 / 25%);
-        color: #fff;
-        font: 600 13px/1.2 system-ui, sans-serif;
-        cursor: pointer;
-      }
+        .rs-search-close,
+        .rs-search-actions button { border: 0; background: transparent; cursor: pointer; }
+        .rs-search-close { color: inherit; font-size: 1.7rem; }
+        .rs-search-actions { display: flex; gap: 10px; flex: none; }
+        .rs-search-actions button { color: #0d6efd; }
 
-      .rs-toolbox-button:hover {
-        filter: brightness(1.08);
-      }
+        .rs-search-input,
+        .rs-search-sort select,
+        .rs-search-load-more {
+          border: 1px solid #adb5bd;
+          background: var(--bs-body-bg, #fff);
+          color: inherit;
+        }
+        .rs-search-input {
+          display: block;
+          width: calc(100% - 32px);
+          margin: 4px 16px 10px;
+          padding: 10px 12px;
+          border-radius: 6px;
+        }
+        .rs-search-sort { display: inline-flex; align-items: center; gap: 6px; }
+        .rs-search-sort select { padding: 2px 6px; border-radius: 4px; font: inherit; }
 
-      .rs-toolbox-button:disabled {
-        opacity: .6;
-        cursor: wait;
-      }
+        .rs-search-toolbar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          flex-wrap: wrap;
+          padding: 0 16px 10px;
+          font-size: .8rem;
+          font-variant-numeric: tabular-nums;
+        }
+        /* the status owns the leftover width so a growing message cannot reflow the controls */
+        .rs-search-update-status {
+          flex: 1 1 auto;
+          min-width: 0;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .rs-search-toolbar-controls { display: flex; align-items: center; gap: 12px; flex: none; }
+        .rs-search-toolbar,
+        .rs-search-result-meta,
+        .rs-search-empty { color: var(--bs-secondary-color, #6c757d); }
 
-      .rs-reveal-button {
-        background: #198754;
-      }
-
-      .rs-search-open {
-        background: #0d6efd;
-      }
-
-      .rs-reveal-toast {
-        position: absolute;
-        right: 0;
-        bottom: calc(100% + 8px);
-        max-width: 320px;
-        width: max-content;
-        padding: 8px 12px;
-        border-radius: 8px;
-        background: #212529;
-        color: #fff;
-        font: 12px/1.35 system-ui, sans-serif;
-        opacity: 0;
-        transition: opacity .2s;
-        pointer-events: none;
-      }
-
-      .rs-reveal-toast.is-visible {
-        opacity: .95;
-      }
-
-      .rs-search-dialog {
-        position: fixed;
-        inset: 0;
-        z-index: 100000;
-        display: none;
-        align-items: flex-start;
-        justify-content: center;
-        padding: 8vh 16px 16px;
-        background: rgb(0 0 0 / 55%);
-      }
-
-      .rs-search-dialog.is-open {
-        display: flex;
-      }
-
-      .rs-search-panel {
-        width: min(720px, 100%);
-        max-height: 84vh;
-        overflow: hidden;
-        border-radius: 10px;
-        background: var(--bs-body-bg, #fff);
-        box-shadow: 0 12px 40px rgb(0 0 0 / 35%);
-        color: var(--bs-body-color, #212529);
-        display: flex;
-        flex-direction: column;
-      }
-
-      .rs-search-panel header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 14px 16px 8px;
-      }
-
-      .rs-search-panel h2 {
-        margin: 0;
-        font-size: 1.2rem;
-      }
-
-      .rs-search-close {
-        border: 0;
-        background: transparent;
-        color: inherit;
-        font-size: 1.7rem;
-        cursor: pointer;
-      }
-
-      .rs-search-input {
-        display: block;
-        width: calc(100% - 32px);
-        margin: 4px 16px 10px;
-        padding: 10px 12px;
-        border: 1px solid #adb5bd;
-        border-radius: 6px;
-        background: var(--bs-body-bg, #fff);
-        color: inherit;
-      }
-
-      .rs-search-toolbar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        flex-wrap: wrap;
-        padding: 0 16px 10px;
-        color: var(--bs-secondary-color, #6c757d);
-        font-size: .8rem;
-      }
-
-      .rs-search-toolbar-controls {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        flex: none;
-      }
-
-      .rs-search-sort {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-      }
-
-      .rs-search-sort select {
-        padding: 2px 6px;
-        border: 1px solid #adb5bd;
-        border-radius: 4px;
-        background: var(--bs-body-bg, #fff);
-        color: inherit;
-        font: inherit;
-      }
-
-      .rs-search-actions {
-        display: flex;
-        gap: 10px;
-        flex: none;
-      }
-
-      .rs-search-actions button {
-        border: 0;
-        background: transparent;
-        color: #0d6efd;
-        cursor: pointer;
-      }
-
-      .rs-search-results {
-        flex: 1;
-        min-height: 0;
-        overflow-y: auto;
-        border-top: 1px solid rgb(128 128 128 / 25%);
-      }
-
-      .rs-search-result {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-        padding: 10px 16px;
-        border-bottom: 1px solid rgb(128 128 128 / 18%);
-        color: inherit;
-        text-decoration: none;
-      }
-
-      .rs-search-result:hover {
-        background: rgb(13 110 253 / 8%);
-      }
-
-      .rs-search-result-meta {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px 14px;
-        color: var(--bs-secondary-color, #6c757d);
-        font-size: .78rem;
-      }
-
-      .rs-search-result-meta b {
-        font-weight: 600;
-        color: inherit;
-      }
-
-      .rs-search-empty {
-        margin: 0;
-        padding: 24px 16px;
-        color: var(--bs-secondary-color, #6c757d);
-        text-align: center;
-      }
-
-      .rs-search-load-more {
-        display: block;
-        width: 100%;
-        margin-top: 8px;
-        padding: 10px 12px;
-        border: 1px solid #adb5bd;
-        border-radius: 6px;
-        background: var(--bs-body-bg, #fff);
-        color: inherit;
-        font: inherit;
-        cursor: pointer;
-      }
-
-      .rs-search-load-more:hover {
-        background: rgb(13 110 253 / 8%);
-      }
-
-      .rs-search-results-summary {
-        padding: 10px 16px 16px;
-        border-top: 1px solid rgb(128 128 128 / 18%);
-      }
-
-      .rs-search-result-count {
-        margin: 0;
-        color: var(--bs-secondary-color, #6c757d);
-        font-size: .78rem;
-        text-align: center;
-      }
-    `;
-    document.head.append(style);
+        .rs-search-results {
+          flex: 1;
+          min-height: 0;
+          overflow-y: auto;
+          border-top: 1px solid rgb(128 128 128 / 25%);
+        }
+        .rs-search-result {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          padding: 10px 16px;
+          border-bottom: 1px solid rgb(128 128 128 / 18%);
+          color: inherit;
+          text-decoration: none;
+        }
+        .rs-search-result:hover,
+        .rs-search-load-more:hover { background: rgb(13 110 253 / 8%); }
+        .rs-search-result-meta {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px 14px;
+          font-size: .78rem;
+        }
+        .rs-search-empty { margin: 0; padding: 24px 16px; text-align: center; }
+        .rs-search-load-more {
+          display: block;
+          width: 100%;
+          margin-top: 8px;
+          padding: 10px 12px;
+          border-radius: 6px;
+          font: inherit;
+          cursor: pointer;
+        }
+        .rs-search-results-summary {
+          padding: 10px 16px 16px;
+          border-top: 1px solid rgb(128 128 128 / 18%);
+        }
+      `,
+    }));
   }
 
   function ensureToolbox() {
     let toolbox = document.querySelector('.rs-toolbox');
     if (!toolbox) {
-      toolbox = document.createElement('div');
-      toolbox.className = 'rs-toolbox';
+      toolbox = el('div', { className: 'rs-toolbox' });
       document.body.append(toolbox);
     }
     return toolbox;
@@ -335,8 +272,7 @@
   function showToast(message) {
     let toast = document.querySelector('.rs-reveal-toast');
     if (!toast) {
-      toast = document.createElement('div');
-      toast.className = 'rs-reveal-toast';
+      toast = el('div', { className: 'rs-reveal-toast' });
       ensureToolbox().append(toast);
     }
 
@@ -347,14 +283,14 @@
   }
 
   function createLink(url, text = url, title = 'Revealed hidden link') {
-    const link = document.createElement('a');
-    link.className = 'rs-revealed-link';
-    link.href = url;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
-    link.textContent = text;
-    link.title = title;
-    return link;
+    return el('a', {
+      className: 'rs-revealed-link',
+      href: url,
+      target: '_blank',
+      rel: 'noopener noreferrer',
+      textContent: text,
+      title,
+    });
   }
 
   function toAbsoluteUrl(value) {
@@ -397,23 +333,22 @@
       const url = findLockedUrl(lock);
       if (!url) continue;
 
-      const wrapper = lock.parentElement?.tagName === 'A'
-        ? lock.parentElement
-        : lock;
+      const wrapper = lock.parentElement?.tagName === 'A' ? lock.parentElement : lock;
+      const title = 'Revealed from the public upload URL';
 
       if (isImageUrl(url)) {
-        const image = document.createElement('img');
-        image.className = 'rs-revealed-image img-fluid';
-        image.src = url;
-        image.alt = 'Revealed media';
-        image.loading = 'lazy';
-        image.title = 'Revealed from the public upload URL';
-
+        const image = el('img', {
+          className: 'rs-revealed-image img-fluid',
+          src: url,
+          alt: 'Revealed media',
+          loading: 'lazy',
+          title,
+        });
         const link = createLink(url, '', 'Open revealed media');
         link.append(image);
         wrapper.replaceWith(link);
       } else {
-        wrapper.replaceWith(createLink(url, url, 'Revealed from the public upload URL'));
+        wrapper.replaceWith(createLink(url, url, title));
       }
 
       revealedCount++;
@@ -434,24 +369,29 @@
     return post.querySelector(POST_CONTENT) || post.querySelector('.content') || post;
   }
 
-  async function fetchRawPost(postId) {
-    if (rawPostCache.has(postId)) return rawPostCache.get(postId);
-
-    const request = fetch(`${API_POSTS}/${postId}`, {
+  async function fetchJson(url) {
+    const response = await fetch(url, {
       credentials: 'same-origin',
       headers: { Accept: 'application/json' },
       cache: 'no-store',
-    }).then(async (response) => {
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-      const body = await response.json();
-      if (body.status?.code && body.status.code !== 'ok') {
-        throw new Error(body.status.message || body.status.code);
-      }
-
-      return body.response?.content ?? body.content ?? '';
     });
 
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const body = await response.json();
+    // NodeBB answers with HTTP 200 and an error envelope, so the status has to be checked too
+    if (body.status?.code && body.status.code !== 'ok') {
+      throw new Error(body.status.message || body.status.code);
+    }
+
+    return body;
+  }
+
+  async function fetchRawPost(postId) {
+    if (rawPostCache.has(postId)) return rawPostCache.get(postId);
+
+    const request = fetchJson(`${API_POSTS}/${postId}`)
+      .then((body) => body.response?.content ?? body.content ?? '');
     rawPostCache.set(postId, request);
 
     try {
@@ -483,9 +423,26 @@
     return extractUrls(rawContent).filter((url) => {
       const absoluteUrl = toAbsoluteUrl(url);
       if (!absoluteUrl) return false;
+      // forum-hosted attachments are already rendered, so listing them again is noise
       if (absoluteUrl.startsWith(`${location.origin}/assets/`)) return false;
       return !visible.has(absoluteUrl);
     });
+  }
+
+  function appendExtraLinks(postContent, urls, title) {
+    if (!urls.length || postContent.querySelector('.rs-extra-links')) return;
+
+    const container = el(
+      'div',
+      { className: 'rs-extra-links' },
+      el('strong', { textContent: 'Revealed links' })
+    );
+
+    for (const url of urls) {
+      container.append(el('br'), createLink(url, url, title));
+    }
+
+    postContent.append(container);
   }
 
   function replaceHiddenLinks(postContent, urls, postId) {
@@ -497,24 +454,8 @@
       placeholders[index].replaceWith(createLink(urls[index], urls[index], title));
     }
 
+    // the raw post can hold more links than it has placeholders, so nothing is dropped
     appendExtraLinks(postContent, urls.slice(replacementCount), title);
-  }
-
-  function appendExtraLinks(postContent, urls, title) {
-    if (!urls.length || postContent.querySelector('.rs-extra-links')) return;
-
-    const container = document.createElement('div');
-    container.className = 'rs-extra-links';
-
-    const heading = document.createElement('strong');
-    heading.textContent = 'Revealed links';
-    container.append(heading);
-
-    for (const url of urls) {
-      container.append(document.createElement('br'), createLink(url, url, title));
-    }
-
-    postContent.append(container);
   }
 
   function hiddenPosts() {
@@ -559,9 +500,7 @@
     const parts = [];
     if (mediaCount) parts.push(countLabel(mediaCount, 'media item'));
     if (linkCount) {
-      parts.push(
-        `${countLabel(linkCount, 'link')} in ${countLabel(postCount, 'post')}`
-      );
+      parts.push(`${countLabel(linkCount, 'link')} in ${countLabel(postCount, 'post')}`);
     }
     return `Unlocked ${parts.join(', ')}`;
   }
@@ -575,11 +514,7 @@
     }
 
     button.textContent = `${countLabel(totalItems, 'item')} unlocked`;
-    button.title = resultMessage(
-      revealedTotals.media,
-      revealedTotals.posts,
-      revealedTotals.links
-    );
+    button.title = resultMessage(revealedTotals.media, revealedTotals.posts, revealedTotals.links);
   }
 
   async function revealAll({ notifyIfEmpty = true } = {}) {
@@ -601,10 +536,10 @@
         revealedTotals.links += linkCount;
         revealedTotals.posts += postCount;
         showToast(resultMessage(mediaCount, postCount, linkCount));
-      } else if (notifyIfEmpty && (revealedTotals.media || revealedTotals.links)) {
-        showToast('Everything on this page is already unlocked');
       } else if (notifyIfEmpty) {
-        showToast('No hidden content found on this page');
+        showToast(revealedTotals.media || revealedTotals.links
+          ? 'Everything on this page is already unlocked'
+          : 'No hidden content found on this page');
       }
     } finally {
       revealInProgress = false;
@@ -616,29 +551,29 @@
   }
 
   function needsReveal() {
-    return Boolean(
-      document.querySelector(LOCKED_MEDIA) ||
-      document.querySelector(HIDDEN_LINK)
-    );
+    return Boolean(document.querySelector(LOCKED_MEDIA) || document.querySelector(HIDDEN_LINK));
   }
 
   function scheduleReveal() {
     if (!needsReveal()) return;
     clearTimeout(revealTimer);
+    // debounced because NodeBB rewrites the post list in several bursts per navigation
     revealTimer = setTimeout(() => {
       if (needsReveal()) revealAll({ notifyIfEmpty: false });
     }, 350);
   }
 
   function addRevealButton() {
-    if (document.querySelector('.rs-reveal-button')) return;
-
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'rs-toolbox-button rs-reveal-button';
-    button.addEventListener('click', () => revealAll());
+    let button = document.querySelector('.rs-reveal-button');
+    if (!button) {
+      button = el('button', {
+        type: 'button',
+        className: 'rs-toolbox-button rs-reveal-button',
+      });
+      button.addEventListener('click', () => revealAll());
+      ensureToolbox().append(button);
+    }
     updateRevealButton(button);
-    ensureToolbox().append(button);
   }
 
   function requestResult(request) {
@@ -663,16 +598,13 @@
     request.onupgradeneeded = (event) => {
       const database = request.result;
 
-      if (!database.objectStoreNames.contains(TOPICS_STORE)) {
-        database.createObjectStore(TOPICS_STORE, { keyPath: 'id' });
-      } else if (event.oldVersion < 2) {
-        request.transaction.objectStore(TOPICS_STORE).clear();
-      }
-
-      if (!database.objectStoreNames.contains(META_STORE)) {
-        database.createObjectStore(META_STORE, { keyPath: 'key' });
-      } else if (event.oldVersion < 2) {
-        request.transaction.objectStore(META_STORE).clear();
+      for (const [name, keyPath] of [[TOPICS_STORE, 'id'], [META_STORE, 'key']]) {
+        if (!database.objectStoreNames.contains(name)) {
+          database.createObjectStore(name, { keyPath });
+        } else if (event.oldVersion < 2) {
+          // v1 records predate the normalized title fields, so rebuild instead of migrating
+          request.transaction.objectStore(name).clear();
+        }
       }
     };
 
@@ -680,81 +612,69 @@
     return searchState.database;
   }
 
-  async function readMeta(key) {
+  async function readStore(storeName, read) {
     const database = await openDatabase();
-    const transaction = database.transaction(META_STORE, 'readonly');
-    const record = await requestResult(transaction.objectStore(META_STORE).get(key));
-    return record?.value;
+    const transaction = database.transaction(storeName, 'readonly');
+    return requestResult(read(transaction.objectStore(storeName)));
   }
 
-  async function writeMeta(entries) {
+  async function writeStore(storeName, write) {
     const database = await openDatabase();
-    const transaction = database.transaction(META_STORE, 'readwrite');
-    const store = transaction.objectStore(META_STORE);
-
-    for (const [key, value] of Object.entries(entries)) {
-      store.put({ key, value });
-    }
-
+    const transaction = database.transaction(storeName, 'readwrite');
+    write(transaction.objectStore(storeName));
     await transactionDone(transaction);
   }
 
-  async function topicCount() {
-    const database = await openDatabase();
-    const transaction = database.transaction(TOPICS_STORE, 'readonly');
-    return requestResult(transaction.objectStore(TOPICS_STORE).count());
+  async function readMeta(key) {
+    const record = await readStore(META_STORE, (store) => store.get(key));
+    return record?.value;
   }
 
-  async function readAllTopics() {
-    const database = await openDatabase();
-    const transaction = database.transaction(TOPICS_STORE, 'readonly');
-    return requestResult(transaction.objectStore(TOPICS_STORE).getAll());
+  function writeMeta(entries) {
+    return writeStore(META_STORE, (store) => {
+      for (const [key, value] of Object.entries(entries)) store.put({ key, value });
+    });
+  }
+
+  function topicCount() {
+    return readStore(TOPICS_STORE, (store) => store.count());
+  }
+
+  function readAllTopics() {
+    return readStore(TOPICS_STORE, (store) => store.getAll());
   }
 
   function mergeTopicRecord(existing, topic) {
     if (!existing) return topic;
 
-    const fromApi = topic.statsFetchedAt != null;
-    const existingFromApi = existing.statsFetchedAt != null;
+    const merged = { ...existing };
+    for (const [key, value] of Object.entries(topic)) {
+      if (value != null) merged[key] = value;
+    }
 
-    return {
-      ...existing,
-      ...topic,
-      title: fromApi
-        ? topic.title
-        : (existingFromApi ? existing.title : (topic.title ?? existing.title)),
-      normalizedTitle: fromApi
-        ? topic.normalizedTitle
-        : (existingFromApi ? existing.normalizedTitle : (topic.normalizedTitle ?? existing.normalizedTitle)),
-      slugTitle: topic.slugTitle ?? existing.slugTitle,
-      normalizedSlugTitle: topic.normalizedSlugTitle ?? existing.normalizedSlugTitle,
-      votes: topic.votes ?? existing.votes,
-      views: topic.views ?? existing.views,
-      posts: topic.posts ?? existing.posts,
-      lastposttime: topic.lastposttime ?? existing.lastposttime,
-      timestamp: topic.timestamp ?? existing.timestamp,
-      statsFetchedAt: topic.statsFetchedAt ?? existing.statsFetchedAt,
-    };
+    // sitemap records only carry a slug-derived title, so they must not overwrite an API title
+    if (existing.statsFetchedAt != null && topic.statsFetchedAt == null) {
+      merged.title = existing.title;
+      merged.normalizedTitle = existing.normalizedTitle;
+    }
+
+    return merged;
   }
 
   async function saveTopics(topics, replaceExisting) {
-    const database = await openDatabase();
-    const transaction = database.transaction(TOPICS_STORE, 'readwrite');
-    const store = transaction.objectStore(TOPICS_STORE);
+    await writeStore(TOPICS_STORE, (store) => {
+      if (replaceExisting) {
+        store.clear();
+        for (const topic of topics) store.put(topic);
+        return;
+      }
 
-    if (replaceExisting) {
-      store.clear();
-      for (const topic of topics) store.put(topic);
-    } else {
+      // merging inside the transaction keeps parallel batches from clobbering each other
       for (const topic of topics) {
         const request = store.get(topic.id);
-        request.onsuccess = () => {
-          store.put(mergeTopicRecord(request.result, topic));
-        };
+        request.onsuccess = () => store.put(mergeTopicRecord(request.result, topic));
       }
-    }
-
-    await transactionDone(transaction);
+    });
 
     if (searchState.topics) {
       const byId = new Map(searchState.topics.map((topic) => [topic.id, topic]));
@@ -765,32 +685,38 @@
     }
   }
 
+  // keeps a bulk index from firing hundreds of parallel requests at the forum
+  async function inBatches(items, handleGroup) {
+    for (let offset = 0; offset < items.length; offset += FETCH_CONCURRENCY) {
+      await handleGroup(items.slice(offset, offset + FETCH_CONCURRENCY), offset);
+    }
+  }
+
+  // one failed item must not discard the whole group, so failures resolve to null
+  function settleGroup(items, run, describe) {
+    return Promise.all(items.map(async (item) => {
+      try {
+        return await run(item);
+      } catch (error) {
+        console.warn(describe(item), error);
+        return null;
+      }
+    }));
+  }
+
   function needsStats(topic) {
     if (topic.votes == null || topic.views == null || topic.posts == null) return true;
-    if (topic.lastposttime == null) return true;
-    if (!topic.statsFetchedAt) return true;
+    if (topic.lastposttime == null || !topic.statsFetchedAt) return true;
     return Date.now() - topic.statsFetchedAt >= STATS_REFRESH_INTERVAL;
   }
 
   async function fetchTopicStats(topic) {
-    const response = await fetch(`${API_TOPICS}/${topic.id}`, {
-      credentials: 'same-origin',
-      headers: { Accept: 'application/json' },
-      cache: 'no-store',
-    });
-
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-    const body = await response.json();
-    if (body.status?.code && body.status.code !== 'ok') {
-      throw new Error(body.status.message || body.status.code);
-    }
-
+    const body = await fetchJson(`${API_TOPICS}/${topic.id}`);
     const data = body.response ?? body;
     const title = String(data.title || topic.title || '');
-    const slugPart = String(data.slug || topic.url?.split('/topic/')[1] || '')
-      .replace(/^\d+\//, '');
+    const slugPart = String(data.slug || topic.url?.split('/topic/')[1] || '').replace(/^\d+\//, '');
     const slugTitle = topic.slugTitle || readableTitle(slugPart || `topic-${topic.id}`);
+
     return {
       id: topic.id,
       title,
@@ -806,32 +732,28 @@
     };
   }
 
-  async function enrichTopicStats(topics) {
+  async function enrichTopicStats(topics, isWanted = () => true) {
     const pending = topics.filter(needsStats);
-    if (!pending.length) return topics;
 
-    for (let offset = 0; offset < pending.length; offset += FETCH_CONCURRENCY) {
-      const group = pending.slice(offset, offset + FETCH_CONCURRENCY);
-      const updates = await Promise.all(
-        group.map(async (topic) => {
-          try {
-            return await fetchTopicStats(topic);
-          } catch (error) {
-            console.warn(`Could not load stats for topic ${topic.id}:`, error);
-            return null;
-          }
-        })
+    await inBatches(pending, async (group) => {
+      // a search abandoned mid-flight would otherwise keep fetching stats nobody will see
+      if (!isWanted()) return;
+
+      const updates = await settleGroup(
+        group,
+        fetchTopicStats,
+        (topic) => `Could not load stats for topic ${topic.id}:`
       );
 
       const saved = updates.filter(Boolean);
-      if (saved.length) await saveTopics(saved, false);
+      if (!saved.length) return;
 
+      await saveTopics(saved, false);
       for (const update of saved) {
         const topic = topics.find((entry) => entry.id === update.id);
-        if (!topic) continue;
-        Object.assign(topic, update);
+        if (topic) Object.assign(topic, update);
       }
-    }
+    });
 
     return topics;
   }
@@ -855,17 +777,15 @@
           signal: controller.signal,
         });
 
-        if (!response.ok) {
-          throw new Error(`${url} returned HTTP ${response.status}`);
-        }
+        if (!response.ok) throw new Error(`${url} returned HTTP ${response.status}`);
 
         const text = await response.text();
-        const document = new DOMParser().parseFromString(text, 'application/xml');
-        if (document.querySelector('parsererror')) {
+        const parsed = new DOMParser().parseFromString(text, 'application/xml');
+        if (parsed.querySelector('parsererror')) {
           throw new Error(`${url} returned invalid XML`);
         }
 
-        return document;
+        return parsed;
       } catch (error) {
         lastError = error;
         if (attempt < FETCH_ATTEMPTS) await wait(attempt * 1000);
@@ -877,8 +797,8 @@
     throw lastError;
   }
 
-  function sitemapLocations(document) {
-    return [...document.querySelectorAll('sitemap > loc, url > loc')]
+  function sitemapLocations(sitemap) {
+    return [...sitemap.querySelectorAll('sitemap > loc, url > loc')]
       .map((node) => node.textContent.trim())
       .filter(Boolean);
   }
@@ -892,7 +812,7 @@
     try {
       decoded = decodeURIComponent(slug);
     } catch {
-      // Keep the encoded slug when it contains invalid escape sequences.
+      // keep the encoded slug when it contains invalid escape sequences
     }
 
     return decoded.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
@@ -907,16 +827,10 @@
       .trim();
   }
 
-  function topicSlugPart(entry) {
-    const slug = String(entry.slug || '');
-    return slug.replace(/^\d+\//, '') || `topic-${entry.tid ?? entry.id}`;
-  }
-
-  function topicFromApiEntry(entry) {
-    const id = Number(entry.tid ?? entry.id);
-    const slugPart = topicSlugPart(entry);
+  // the sitemap and the JSON feeds describe the same topics, only their extras differ
+  function topicRecord(id, slugPart, rawTitle, origin = location.origin) {
     const slugTitle = readableTitle(slugPart);
-    const title = String(entry.title || slugTitle);
+    const title = String(rawTitle || slugTitle);
 
     return {
       id,
@@ -924,7 +838,16 @@
       normalizedTitle: normalizeText(title),
       slugTitle,
       normalizedSlugTitle: normalizeText(slugTitle),
-      url: `${location.origin}/topic/${id}/${slugPart}`,
+      url: `${origin}/topic/${id}/${slugPart}`,
+    };
+  }
+
+  function topicFromApiEntry(entry) {
+    const id = Number(entry.tid ?? entry.id);
+    const slugPart = String(entry.slug || '').replace(/^\d+\//, '') || `topic-${id}`;
+
+    return {
+      ...topicRecord(id, slugPart, entry.title),
       lastposttime: Number(entry.lastposttime ?? 0),
       timestamp: Number(entry.timestamp ?? 0),
       votes: Number(entry.upvotes ?? entry.votes ?? 0),
@@ -934,79 +857,109 @@
     };
   }
 
-  async function fetchRecentFeedTopics() {
+  // walks a listing endpoint one request at a time, keeping whatever arrived before a bad page
+  async function fetchFeedTopics(urls, { isLastPage = () => false, onPage = () => {} } = {}) {
     const topics = [];
 
-    for (let start = 0; start < RECENT_FEED_PAGES * 20; start += 20) {
-      const response = await fetch(`/api/recent?start=${start}`, {
-        credentials: 'same-origin',
-        headers: { Accept: 'application/json' },
-        cache: 'no-store',
-      });
-
-      if (!response.ok) break;
-
-      const body = await response.json();
-      for (const entry of body.topics || []) {
-        topics.push(topicFromApiEntry(entry));
+    for (const url of urls) {
+      let body;
+      try {
+        body = await fetchJson(url);
+      } catch (error) {
+        console.warn(`Could not read feed page ${url}:`, error);
+        break;
       }
 
-      if (!body.nextStart || (body.topics || []).length < 20) break;
+      const entries = body.topics || [];
+      topics.push(...entries.map(topicFromApiEntry));
+      onPage(entries.length);
+      if (!entries.length || isLastPage(body, entries)) break;
     }
 
     return topics;
   }
 
-  async function fetchCategoryFeedTopics(categoryId) {
-    const topics = [];
-
-    for (let page = 1; page <= SUPPLEMENT_CATEGORY_PAGES; page++) {
-      const response = await fetch(`/api/category/${categoryId}/topics?page=${page}`, {
-        credentials: 'same-origin',
-        headers: { Accept: 'application/json' },
-        cache: 'no-store',
-      });
-
-      if (!response.ok) break;
-
-      const body = await response.json();
-      for (const entry of body.topics || []) {
-        topics.push(topicFromApiEntry(entry));
-      }
-
-      if (!(body.topics || []).length) break;
-    }
-
-    return topics;
+  function pageUrls(count, buildUrl) {
+    return Array.from({ length: count }, (unused, index) => buildUrl(index));
   }
 
-  async function supplementLiveTopics({ rerunSearch = false } = {}) {
-    if (searchState.supplementing) return 0;
-    searchState.supplementing = true;
+  // opening the dialog starts a silent refresh, so an explicit update waits for that to land
+  // instead of being dropped by the guard and never running at all
+  async function indexNewestTopics({ queueIfBusy = false, ...options } = {}) {
+    while (searchState.newestTopicsRun) {
+      if (!queueIfBusy) return 0;
+      await searchState.newestTopicsRun;
+    }
+
+    searchState.newestTopicsRun = fetchNewestTopics(options);
+    try {
+      return await searchState.newestTopicsRun;
+    } finally {
+      searchState.newestTopicsRun = null;
+    }
+  }
+
+  // topics posted since the last sitemap build appear in no partition, so the live feeds catch them
+  async function fetchNewestTopics({ rerunSearch = false, showProgress = false } = {}) {
+    // the recent feed walks a row offset and the category feed walks page numbers, so each
+    // side reports what it actually has
+    const recentLimit = RECENT_FEED_PAGES * FEED_PAGE_SIZE;
+    const categoryPageCount = EXTRA_FEED_CATEGORIES.length * CATEGORY_FEED_PAGES;
+    const categoryLabel = EXTRA_FEED_CATEGORIES.map((category) => category.name).join(', ');
+    let recentSeen = 0;
+    let categoryPages = 0;
+    const showFeedProgress = () => {
+      if (showProgress) {
+        setUpdateStatus(
+          `Refreshing newest topics · recent ${recentSeen}/${recentLimit}` +
+          ` · ${categoryLabel} page ${categoryPages}/${categoryPageCount}`
+        );
+      }
+    };
+    const countRecentTopics = (entryCount) => {
+      recentSeen += entryCount;
+      showFeedProgress();
+    };
+    const countCategoryPage = () => {
+      categoryPages++;
+      showFeedProgress();
+    };
+
+    showFeedProgress();
 
     try {
       const batches = await Promise.all([
-        fetchRecentFeedTopics(),
-        ...SUPPLEMENT_CATEGORY_IDS.map((categoryId) => fetchCategoryFeedTopics(categoryId)),
+        fetchFeedTopics(
+          pageUrls(RECENT_FEED_PAGES, (index) => `/api/recent?start=${index * FEED_PAGE_SIZE}`),
+          {
+            isLastPage: (body, entries) => !body.nextStart || entries.length < FEED_PAGE_SIZE,
+            onPage: countRecentTopics,
+          }
+        ),
+        ...EXTRA_FEED_CATEGORIES.map(({ id }) => fetchFeedTopics(
+          pageUrls(
+            CATEGORY_FEED_PAGES,
+            (index) => `/api/category/${id}/topics?page=${index + 1}`
+          ),
+          { onPage: countCategoryPage }
+        )),
       ]);
-      const topics = batches.flat();
 
+      const topics = batches.flat();
       if (topics.length) await saveTopics(topics, false);
       if (rerunSearch && topics.length) runSearch();
 
       return topics.length;
     } catch (error) {
-      console.warn('Live topic supplement failed:', error);
+      console.warn('Newest topic refresh failed:', error);
       return 0;
-    } finally {
-      searchState.supplementing = false;
     }
   }
 
-  function parseTopicSitemap(document) {
+  function parseTopicSitemap(sitemap) {
     const topics = [];
 
-    for (const urlNode of document.querySelectorAll('url')) {
+    for (const urlNode of sitemap.querySelectorAll('url')) {
       const sitemapUrl = urlNode.querySelector('loc')?.textContent.trim();
       if (!sitemapUrl) continue;
 
@@ -1021,18 +974,10 @@
       if (!match) continue;
 
       const id = Number(match[1]);
-      const slug = match[2] || `topic-${id}`;
-      const slugTitle = readableTitle(slug);
-      const lastModified = urlNode.querySelector('lastmod')?.textContent.trim() || '';
 
       topics.push({
-        id,
-        title: slugTitle,
-        normalizedTitle: normalizeText(slugTitle),
-        slugTitle,
-        normalizedSlugTitle: normalizeText(slugTitle),
-        url: `${url.origin}/topic/${id}/${slug}`,
-        lastModified,
+        ...topicRecord(id, match[2] || `topic-${id}`, '', url.origin),
+        lastModified: urlNode.querySelector('lastmod')?.textContent.trim() || '',
       });
     }
 
@@ -1041,7 +986,11 @@
 
   function setUpdateStatus(message) {
     const status = document.querySelector('.rs-search-update-status');
-    if (status) status.textContent = message;
+    if (!status) return;
+
+    status.textContent = message;
+    // the toolbar clips overflow to stay on one row, so keep the untruncated text reachable
+    status.title = message;
   }
 
   function setIndexButtonsDisabled(disabled) {
@@ -1058,26 +1007,16 @@
     const total = searchState.allResults.length;
     const showing = getDisplayedResults().length;
 
-    if (total === 0) return 'No results';
-    if (total > showing) {
-      return `Showing ${showing.toLocaleString()} of ${total.toLocaleString()} results`;
-    }
-    return total === 1
-      ? 'Showing 1 result'
-      : `Showing all ${total.toLocaleString()} results`;
+    if (!total) return 'No results';
+    if (total > showing) return `Showing ${formatCount(showing)} of ${formatCount(total)} results`;
+    return total === 1 ? 'Showing 1 result' : `Showing all ${formatCount(total)} results`;
   }
 
   function updateToolbarStatus() {
     if (searchState.updating) return;
 
-    const status = document.querySelector('.rs-search-update-status');
-    if (!status) return;
-
-    const parts = [searchState.indexStatus].filter(Boolean);
-    const resultsStatus = formatResultsStatus();
-    if (resultsStatus) parts.push(resultsStatus);
-
-    status.textContent = parts.join(' · ');
+    const parts = [searchState.indexStatus, formatResultsStatus()].filter(Boolean);
+    setUpdateStatus(parts.join(' · '));
   }
 
   function setIndexStatus(message) {
@@ -1086,46 +1025,38 @@
   }
 
   async function loadSitemapList() {
-    const document = await fetchXml('/sitemap.xml');
-    return sitemapLocations(document)
+    const sitemap = await fetchXml('/sitemap.xml');
+    return sitemapLocations(sitemap)
       .filter((url) => /\/sitemap\/topics\.\d+\.xml$/.test(url))
       .sort((a, b) => sitemapNumber(a) - sitemapNumber(b));
   }
 
-  async function processSitemaps(sitemaps, completedSitemaps, totalSitemaps) {
-    for (let offset = 0; offset < sitemaps.length; offset += FETCH_CONCURRENCY) {
-      const group = sitemaps.slice(offset, offset + FETCH_CONCURRENCY);
-      const completedCount = completedSitemaps?.size || offset;
+  async function processSitemaps(sitemaps, { completed, total = sitemaps.length, savedCount = 0 } = {}) {
+    await inBatches(sitemaps, async (group, offset) => {
+      const reached = Math.min((completed?.size || offset) + group.length, total);
+      // one fixed-shape write per round trip: anything finer is replaced before it paints
+      setUpdateStatus(`Indexing sitemap ${reached} of ${total} · ${formatCount(savedCount)} topics`);
 
-      setUpdateStatus(
-        `Indexing sitemaps ${completedCount + 1} to ` +
-        `${Math.min(completedCount + group.length, totalSitemaps)} of ${totalSitemaps}...`
+      const batches = await settleGroup(
+        group,
+        async (url) => parseTopicSitemap(await fetchXml(url)),
+        (url) => `Could not index sitemap ${url}:`
       );
 
-      const batches = await Promise.all(
-        group.map(async (url) => {
-          try {
-            return await parseTopicSitemap(await fetchXml(url));
-          } catch (error) {
-            console.warn(`Could not index sitemap ${url}:`, error);
-            return [];
-          }
-        })
-      );
-
-      const topics = batches.flat();
+      const topics = batches.filter(Boolean).flat();
       if (topics.length) {
-        setUpdateStatus(`Saving ${topics.length.toLocaleString()} topics...`);
         await saveTopics(topics, false);
+        savedCount += topics.length;
       }
 
-      if (completedSitemaps) {
-        for (const url of group) completedSitemaps.add(sitemapNumber(url));
+      // recording progress per batch lets an interrupted full build resume where it stopped
+      if (completed) {
+        for (const url of group) completed.add(sitemapNumber(url));
         await writeMeta({
-          completedFullSitemaps: [...completedSitemaps].sort((a, b) => a - b),
+          completedFullSitemaps: [...completed].sort((a, b) => a - b),
         });
       }
-    }
+    });
   }
 
   async function updateIndex({ forceFull = false, forceQuick = false } = {}) {
@@ -1138,18 +1069,11 @@
 
     try {
       const [
-        lastQuickUpdate = 0,
-        lastFullUpdate = 0,
-        currentCount,
-        savedSitemapCount = 0,
-        savedCompletedSitemaps = [],
-        fullBuildInProgress = false,
+        lastQuickUpdate = 0, lastFullUpdate = 0, currentCount,
+        savedSitemapCount = 0, savedCompletedSitemaps = [], fullBuildInProgress = false,
       ] = await Promise.all([
-        readMeta('lastQuickUpdate'),
-        readMeta('lastFullUpdate'),
-        topicCount(),
-        readMeta('fullBuildSitemapCount'),
-        readMeta('completedFullSitemaps'),
+        readMeta('lastQuickUpdate'), readMeta('lastFullUpdate'), topicCount(),
+        readMeta('fullBuildSitemapCount'), readMeta('completedFullSitemaps'),
         readMeta('fullBuildInProgress'),
       ]);
 
@@ -1158,9 +1082,7 @@
         currentCount === 0 ||
         (!forceQuick && startedAt - lastFullUpdate >= FULL_UPDATE_INTERVAL);
       const quickUpdateDue =
-        forceQuick ||
-        fullUpdateDue ||
-        startedAt - lastQuickUpdate >= QUICK_UPDATE_INTERVAL;
+        forceQuick || fullUpdateDue || startedAt - lastQuickUpdate >= QUICK_UPDATE_INTERVAL;
 
       if (!quickUpdateDue) {
         succeeded = true;
@@ -1172,6 +1094,7 @@
 
       if (fullUpdateDue) {
         const completedSitemaps = new Set(savedCompletedSitemaps);
+        // saved progress only lines up while the sitemap layout is unchanged
         const shouldRestart =
           forceFull ||
           !fullBuildInProgress ||
@@ -1192,19 +1115,12 @@
           (url) => !completedSitemaps.has(sitemapNumber(url))
         );
 
-        if (completedSitemaps.size) {
-          setUpdateStatus(
-            `Resuming full index with ${completedSitemaps.size} of ` +
-            `${allSitemaps.length} sitemaps complete...`
-          );
-        }
-
-        await processSitemaps(
-          pendingSitemaps,
-          completedSitemaps,
-          allSitemaps.length
-        );
-
+        // a resumed build carries on from the counts it was interrupted at
+        await processSitemaps(pendingSitemaps, {
+          completed: completedSitemaps,
+          total: allSitemaps.length,
+          savedCount: shouldRestart ? 0 : currentCount,
+        });
         await writeMeta({
           lastFullUpdate: startedAt,
           lastQuickUpdate: startedAt,
@@ -1213,24 +1129,18 @@
         });
       } else {
         const recentSitemaps = allSitemaps.slice(-RECENT_SITEMAP_COUNT);
-        await processSitemaps(recentSitemaps, null, recentSitemaps.length);
-        await writeMeta({
-          lastQuickUpdate: startedAt,
-          sitemapCount: allSitemaps.length,
-        });
+        await processSitemaps(recentSitemaps, { savedCount: currentCount });
+        await writeMeta({ lastQuickUpdate: startedAt, sitemapCount: allSitemaps.length });
       }
 
-      setUpdateStatus('Checking recent topics...');
-      await supplementLiveTopics();
+      await indexNewestTopics({ showProgress: true, queueIfBusy: true });
 
       succeeded = true;
       runSearch();
     } catch (error) {
       console.error('RipperStore index update failed:', error);
       const savedTopics = await topicCount();
-      setUpdateStatus(
-        `Update paused at ${savedTopics.toLocaleString()} topics: ${error.message}`
-      );
+      setUpdateStatus(`Update paused at ${formatCount(savedTopics)} topics: ${error.message}`);
     } finally {
       searchState.updating = false;
       setIndexButtonsDisabled(false);
@@ -1244,11 +1154,8 @@
   }
 
   function getSearchableText(topic) {
-    return [...new Set([topic.normalizedTitle, topic.normalizedSlugTitle].filter(Boolean))].join(' ');
-  }
-
-  function textIncludesToken(text, token) {
-    return text.split(' ').includes(token);
+    const titles = [topic.normalizedTitle, topic.normalizedSlugTitle].filter(Boolean);
+    return [...new Set(titles)].join(' ');
   }
 
   function searchScore(topic, normalizedQuery, tokens) {
@@ -1256,105 +1163,78 @@
     if (String(topic.id) === normalizedQuery) return 1000;
     if (searchable === normalizedQuery) return 900;
     if (searchable.startsWith(normalizedQuery)) return 700;
-    if (!tokens.every((token) => textIncludesToken(searchable, token))) return -1;
 
-    const firstMatch = Math.min(
-      ...tokens.map((token) => {
-        const words = searchable.split(' ');
-        const wordIndex = words.indexOf(token);
-        return wordIndex >= 0 ? wordIndex : searchable.indexOf(token);
-      })
-    );
-    return 500 - firstMatch;
+    const words = searchable.split(' ');
+    if (!tokens.every((token) => words.includes(token))) return -1;
+
+    // titles that match early are usually about the query rather than mentioning it in passing
+    return 500 - Math.min(...tokens.map((token) => words.indexOf(token)));
   }
 
   function getSortMode() {
-    return (
-      document.querySelector('.rs-search-sort-select')?.value ||
-      searchState.sortMode ||
-      'relevance'
-    );
+    const selected = document.querySelector('.rs-search-sort-select')?.value;
+    return selected || searchState.sortMode || 'relevance';
   }
 
+  function getSortDirection() {
+    const selected = document.querySelector('.rs-search-order-select')?.value;
+    return selected || searchState.sortDirection || 'descending';
+  }
+
+  // null rather than a sentinel number, so a real value of zero stays distinguishable
   function getPostedValue(topic) {
     if (topic.timestamp) return topic.timestamp;
-    if (topic.lastModified) {
-      const parsed = Date.parse(topic.lastModified);
-      if (!Number.isNaN(parsed)) return parsed;
-    }
-    return -1;
+
+    const parsed = Date.parse(topic.lastModified || '');
+    return Number.isNaN(parsed) ? null : parsed;
   }
 
   function getLastPostValue(topic) {
-    if (topic.lastposttime) return topic.lastposttime;
-    return -1;
-  }
-
-  function getRecencyValue(topic) {
-    const lastPostMs = getLastPostValue(topic);
-    if (lastPostMs > 0) return lastPostMs;
-
-    const postedMs = getPostedValue(topic);
-    if (postedMs > 0) return postedMs;
-
-    return -1;
+    return topic.lastposttime || null;
   }
 
   function getSortValue(topic, mode) {
-    if (mode === 'lastposttime') return getRecencyValue(topic);
-    if (mode === 'relevance') return null;
-    return topic[mode] ?? -1;
+    if (mode === 'created') return getPostedValue(topic);
+
+    // sitemap-only topics have no reply time, so fall back to when they were posted
+    if (mode === 'lastposttime') return getLastPostValue(topic) ?? getPostedValue(topic);
+
+    return topic[mode] ?? null;
   }
 
-  function compareTopics(a, b, mode) {
-    if (mode !== 'relevance') {
-      const left = getSortValue(a.topic, mode);
-      const right = getSortValue(b.topic, mode);
-      if (right !== left) return right - left;
-    }
+  function sortTopics(topics, scores, mode = getSortMode(), direction = getSortDirection()) {
+    const order = direction === 'ascending' ? -1 : 1;
 
-    return b.score - a.score || b.topic.id - a.topic.id;
-  }
-
-  function sortTopicList(topics, scores, mode = getSortMode()) {
     return [...topics].sort((left, right) => {
       if (mode !== 'relevance') {
         const leftValue = getSortValue(left, mode);
         const rightValue = getSortValue(right, mode);
-        if (rightValue !== leftValue) return rightValue - leftValue;
+        const leftMissing = leftValue === null;
+        const rightMissing = rightValue === null;
+
+        // topics with no value stay at the bottom whichever way the sort runs
+        if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+        if (!leftMissing && leftValue !== rightValue) return order * (rightValue - leftValue);
       }
 
-      return (
-        (scores.get(right.id) || 0) - (scores.get(left.id) || 0) ||
-        right.id - left.id
-      );
+      return order * ((scores.get(right.id) || 0) - (scores.get(left.id) || 0) || right.id - left.id);
     });
   }
 
   async function searchTopics(query) {
     const normalizedQuery = normalizeText(query);
-    if (!normalizedQuery) {
-      return { topics: [], scores: new Map() };
-    }
+    if (!normalizedQuery) return { topics: [], scores: new Map() };
 
     const tokens = normalizedQuery.split(' ');
-    const mode = getSortMode();
-    const matches = (await loadTopicCache())
-      .map((topic) => ({
-        topic,
-        score: searchScore(topic, normalizedQuery, tokens),
-      }))
-      .filter((result) => result.score >= 0)
-      .sort((a, b) => compareTopics(a, b, mode));
+    const scores = new Map();
+    const matches = (await loadTopicCache()).filter((topic) => {
+      const score = searchScore(topic, normalizedQuery, tokens);
+      if (score < 0) return false;
+      scores.set(topic.id, score);
+      return true;
+    });
 
-    const scores = new Map(
-      matches.map((result) => [result.topic.id, result.score])
-    );
-
-    return {
-      topics: matches.map((result) => result.topic),
-      scores,
-    };
+    return { topics: sortTopics(matches, scores), scores };
   }
 
   function getDisplayedResults() {
@@ -1367,30 +1247,13 @@
 
   function formatTimeAgo(timestampMs) {
     const seconds = Math.floor((Date.now() - timestampMs) / 1000);
-    if (seconds < 45) return 'just now';
 
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) {
-      return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+    for (const [unit, unitSeconds] of TIME_UNITS) {
+      const value = Math.floor(seconds / unitSeconds);
+      if (value >= 1) return `${countLabel(value, unit)} ago`;
     }
 
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) {
-      return `${hours} hour${hours === 1 ? '' : 's'} ago`;
-    }
-
-    const days = Math.floor(hours / 24);
-    if (days < 30) {
-      return `${days} day${days === 1 ? '' : 's'} ago`;
-    }
-
-    const months = Math.floor(days / 30);
-    if (months < 12) {
-      return `${months} month${months === 1 ? '' : 's'} ago`;
-    }
-
-    const years = Math.floor(days / 365);
-    return `${years} year${years === 1 ? '' : 's'} ago`;
+    return 'just now';
   }
 
   function formatPostedAt(timestampMs) {
@@ -1408,38 +1271,33 @@
 
     const postedMs = getPostedValue(topic);
     if (postedMs > 0) {
-      parts.push(`posted ${formatTimeAgo(postedMs)} on ${formatPostedAt(postedMs)}`);
+      parts.push(`created ${formatTimeAgo(postedMs)} on ${formatPostedAt(postedMs)}`);
     }
 
     const lastPostMs = getLastPostValue(topic);
     if (lastPostMs > 0 && lastPostMs !== postedMs) {
-      parts.push(`last post ${formatTimeAgo(lastPostMs)} on ${formatPostedAt(lastPostMs)}`);
+      parts.push(`last reply ${formatTimeAgo(lastPostMs)} on ${formatPostedAt(lastPostMs)}`);
     }
 
-    if (topic.votes != null) parts.push(`${formatCount(topic.votes)} votes`);
-    if (topic.views != null) parts.push(`${formatCount(topic.views)} views`);
-    if (topic.posts != null) parts.push(`${formatCount(topic.posts)} posts`);
+    for (const stat of ['votes', 'views', 'posts']) {
+      if (topic[stat] != null) parts.push(`${formatCount(topic[stat])} ${stat}`);
+    }
 
     return parts;
   }
 
-  function appendResultsSummary(results, topics, query) {
-    if (!query.trim() || !topics.length) return;
-
+  function appendResultsSummary(results, shownCount) {
     const total = searchState.allResults.length;
-    const showing = topics.length;
-    if (total <= showing) return;
+    if (total <= shownCount) return;
 
-    const summary = document.createElement('div');
-    summary.className = 'rs-search-results-summary';
-
-    const loadMore = document.createElement('button');
-    loadMore.type = 'button';
-    loadMore.className = 'rs-search-load-more';
-    loadMore.textContent = `Load ${Math.min(RESULT_PAGE_SIZE, total - showing).toLocaleString()} more`;
+    const loadMore = el('button', {
+      type: 'button',
+      className: 'rs-search-load-more',
+      textContent: `Load ${formatCount(Math.min(RESULT_PAGE_SIZE, total - shownCount))} more`,
+    });
     loadMore.addEventListener('click', loadMoreResults);
-    summary.append(loadMore);
-    results.append(summary);
+
+    results.append(el('div', { className: 'rs-search-results-summary' }, loadMore));
   }
 
   function renderResults(topics, query) {
@@ -1447,74 +1305,50 @@
     if (!results) return;
     results.replaceChildren();
 
-    if (!query.trim()) {
-      const message = document.createElement('p');
-      message.className = 'rs-search-empty';
-      message.textContent = 'Search public topic titles.';
-      results.append(message);
-      updateToolbarStatus();
-      return;
-    }
-
-    if (!topics.length) {
-      const message = document.createElement('p');
-      message.className = 'rs-search-empty';
-      message.textContent = 'No matching topics found.';
-      results.append(message);
-      updateToolbarStatus();
-      return;
-    }
-
-    for (const topic of topics) {
-      const link = document.createElement('a');
-      link.className = 'rs-search-result';
-      link.href = topic.url;
-      link.dataset.topicId = String(topic.id);
-
-      const title = document.createElement('strong');
-      title.textContent = topic.title;
-
-      const details = document.createElement('span');
-      details.className = 'rs-search-result-meta';
-
-      for (const part of topicDetailsText(topic)) {
-        const item = document.createElement('span');
-        item.textContent = part;
-        details.append(item);
+    if (!query.trim() || !topics.length) {
+      const text = query.trim() ? 'No matching topics found.' : 'Search public topic titles.';
+      results.append(el('p', { className: 'rs-search-empty', textContent: text }));
+    } else {
+      for (const topic of topics) {
+        const link = el(
+          'a',
+          { className: 'rs-search-result', href: topic.url },
+          el('strong', { textContent: topic.title }),
+          el(
+            'span',
+            { className: 'rs-search-result-meta' },
+            ...topicDetailsText(topic).map((part) => el('span', { textContent: part }))
+          )
+        );
+        link.dataset.topicId = String(topic.id);
+        results.append(link);
       }
 
-      link.append(title, details);
-      results.append(link);
+      appendResultsSummary(results, topics.length);
     }
 
-    appendResultsSummary(results, topics, query);
     updateToolbarStatus();
   }
 
   async function enrichAndRenderResults(query) {
     const mode = getSortMode();
-    const toEnrich = mode === 'relevance'
-      ? getDisplayedResults()
-      : searchState.allResults;
+    // sorting by a stat needs every candidate's numbers, relevance only needs what is on screen
+    const toEnrich = mode === 'relevance' ? getDisplayedResults() : searchState.allResults;
+    const isCurrentQuery = () => document.querySelector('.rs-search-input')?.value === query;
+    await enrichTopicStats(toEnrich, isCurrentQuery);
 
-    await enrichTopicStats(toEnrich);
-
-    const input = document.querySelector('.rs-search-input');
-    if (!input || input.value !== query) return;
+    if (!isCurrentQuery()) return;
 
     if (mode !== 'relevance') {
-      searchState.allResults = sortTopicList(searchState.allResults, searchState.resultScores);
+      searchState.allResults = sortTopics(searchState.allResults, searchState.resultScores);
     }
 
     renderResults(getDisplayedResults(), query);
   }
 
   async function loadMoreResults() {
-    const input = document.querySelector('.rs-search-input');
-    if (!input) return;
-
-    const query = input.value;
-    if (!query.trim()) return;
+    const query = document.querySelector('.rs-search-input')?.value;
+    if (!query?.trim()) return;
 
     const previousCount = searchState.displayLimit;
     searchState.displayLimit += RESULT_PAGE_SIZE;
@@ -1531,10 +1365,11 @@
     if (!input) return;
 
     const query = input.value;
+    searchState.displayLimit = RESULT_PAGE_SIZE;
+
     if (!query.trim()) {
       searchState.allResults = [];
       searchState.resultScores = new Map();
-      searchState.displayLimit = RESULT_PAGE_SIZE;
       renderResults([], query);
       return;
     }
@@ -1544,7 +1379,6 @@
 
     searchState.allResults = topics;
     searchState.resultScores = scores;
-    searchState.displayLimit = RESULT_PAGE_SIZE;
 
     renderResults(getDisplayedResults(), query);
     await enrichAndRenderResults(query);
@@ -1566,8 +1400,9 @@
       return;
     }
 
-    const updated = new Date(lastQuickUpdate).toLocaleString();
-    setIndexStatus(`${count.toLocaleString()} topics. Updated ${updated}.`);
+    setIndexStatus(
+      `${formatCount(count)} topics. Updated ${new Date(lastQuickUpdate).toLocaleString()}.`
+    );
   }
 
   function closeSearch() {
@@ -1579,8 +1414,7 @@
     if (!dialog) return;
 
     dialog.classList.add('is-open');
-    const input = dialog.querySelector('.rs-search-input');
-    input.focus();
+    dialog.querySelector('.rs-search-input').focus();
 
     await refreshIndexStatus();
     if (await topicCount() === 0) {
@@ -1588,7 +1422,10 @@
       return;
     }
 
-    supplementLiveTopics({ rerunSearch: true }).then((count) => {
+    // a running update finishes with its own refresh, so opening the dialog adds nothing
+    if (searchState.updating) return;
+
+    indexNewestTopics({ rerunSearch: true }).then((count) => {
       if (count) refreshIndexStatus();
     });
   }
@@ -1596,15 +1433,15 @@
   function addSearchInterface() {
     if (document.querySelector('.rs-search-dialog')) return;
 
-    const openButton = document.createElement('button');
-    openButton.type = 'button';
-    openButton.className = 'rs-toolbox-button rs-search-open';
-    openButton.textContent = 'Local search';
-    openButton.title = 'RipperStore Unlocker local topic search';
+    const openButton = el('button', {
+      type: 'button',
+      className: 'rs-toolbox-button rs-search-open',
+      textContent: 'Local search',
+      title: 'RipperStore Unlocker local topic search',
+    });
     openButton.addEventListener('click', openSearch);
 
-    const dialog = document.createElement('div');
-    dialog.className = 'rs-search-dialog';
+    const dialog = el('div', { className: 'rs-search-dialog' });
     dialog.innerHTML = `
       <section class="rs-search-panel" role="dialog" aria-modal="true" aria-label="RipperStore Unlocker search">
         <header>
@@ -1619,10 +1456,18 @@
               Sort
               <select class="rs-search-sort-select" title="Sort search results">
                 <option value="relevance">Relevance</option>
-                <option value="lastposttime">Recent</option>
+                <option value="created" title="When the topic was first posted">Created</option>
+                <option value="lastposttime" title="When the topic was last replied to">Last reply</option>
                 <option value="votes">Votes</option>
                 <option value="views">Views</option>
                 <option value="posts">Posts</option>
+              </select>
+            </label>
+            <label class="rs-search-sort">
+              Order
+              <select class="rs-search-order-select" title="Sort direction">
+                <option value="descending">Descending</option>
+                <option value="ascending">Ascending</option>
               </select>
             </label>
             <div class="rs-search-actions">
@@ -1640,10 +1485,15 @@
     });
     dialog.querySelector('.rs-search-close').addEventListener('click', closeSearch);
     dialog.querySelector('.rs-search-input').addEventListener('input', scheduleSearch);
-    dialog.querySelector('.rs-search-sort-select').addEventListener('change', (event) => {
-      searchState.sortMode = event.target.value;
-      runSearch();
-    });
+    for (const [selector, key] of [
+      ['.rs-search-sort-select', 'sortMode'],
+      ['.rs-search-order-select', 'sortDirection'],
+    ]) {
+      dialog.querySelector(selector).addEventListener('change', (event) => {
+        searchState[key] = event.target.value;
+        runSearch();
+      });
+    }
     dialog.querySelector('.rs-search-update').addEventListener('click', () => {
       updateIndex({ forceQuick: true });
     });
@@ -1659,6 +1509,7 @@
   function scheduleUpdates() {
     clearInterval(searchState.updateTimer);
     searchState.updateTimer = setInterval(() => updateIndex(), QUICK_UPDATE_INTERVAL);
+    // delayed so the first page load is not competing with the index build
     setTimeout(() => updateIndex(), 2000);
   }
 
@@ -1675,8 +1526,6 @@
     revealedTotals = { links: 0, media: 0, posts: 0 };
     addRevealButton();
     addSearchInterface();
-    const button = document.querySelector('.rs-reveal-button');
-    if (button) updateRevealButton(button);
     scheduleReveal();
   }
 
@@ -1686,6 +1535,7 @@
       subtree: true,
     });
 
+    // NodeBB swaps pages client side, so ajaxify is the only reliable navigation signal
     if (window.jQuery) {
       window.jQuery(window).on('action:ajaxify.end', handleNavigation);
     }
@@ -1694,7 +1544,6 @@
 
   function start() {
     addStyles();
-    ensureToolbox();
     addRevealButton();
     addSearchInterface();
     watchPage();
