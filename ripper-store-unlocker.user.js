@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RipperStore Unlocker
 // @namespace    https://forum.ripper.store
-// @version      2.3.4
+// @version      2.4.0
 // @description  Unlocks guest-hidden content and provides private local topic search.
 // @author       VRCUploader Team
 // @match        https://forum.ripper.store/*
@@ -31,6 +31,9 @@
   const FULL_UPDATE_INTERVAL = 7 * 24 * 60 * 60 * 1000;
   const STATS_REFRESH_INTERVAL = 24 * 60 * 60 * 1000;
   const RECENT_SITEMAP_COUNT = 8;
+  const RECENT_FEED_PAGES = 10;
+  const SUPPLEMENT_CATEGORY_IDS = [44];
+  const SUPPLEMENT_CATEGORY_PAGES = 2;
   const FETCH_CONCURRENCY = 4;
   const FETCH_TIMEOUT = 20_000;
   const FETCH_ATTEMPTS = 3;
@@ -52,6 +55,7 @@
     resultScores: new Map(),
     displayLimit: RESULT_PAGE_SIZE,
     indexStatus: '',
+    supplementing: false,
   };
 
   function addStyles() {
@@ -722,6 +726,8 @@
       normalizedTitle: fromApi
         ? topic.normalizedTitle
         : (existingFromApi ? existing.normalizedTitle : (topic.normalizedTitle ?? existing.normalizedTitle)),
+      slugTitle: topic.slugTitle ?? existing.slugTitle,
+      normalizedSlugTitle: topic.normalizedSlugTitle ?? existing.normalizedSlugTitle,
       votes: topic.votes ?? existing.votes,
       views: topic.views ?? existing.views,
       posts: topic.posts ?? existing.posts,
@@ -782,10 +788,15 @@
 
     const data = body.response ?? body;
     const title = String(data.title || topic.title || '');
+    const slugPart = String(data.slug || topic.url?.split('/topic/')[1] || '')
+      .replace(/^\d+\//, '');
+    const slugTitle = topic.slugTitle || readableTitle(slugPart || `topic-${topic.id}`);
     return {
       id: topic.id,
       title,
       normalizedTitle: normalizeText(title),
+      slugTitle,
+      normalizedSlugTitle: topic.normalizedSlugTitle || normalizeText(slugTitle),
       votes: Number(data.votes ?? data.upvotes ?? 0),
       views: Number(data.viewcount ?? 0),
       posts: Number(data.postcount ?? 0),
@@ -896,6 +907,102 @@
       .trim();
   }
 
+  function topicSlugPart(entry) {
+    const slug = String(entry.slug || '');
+    return slug.replace(/^\d+\//, '') || `topic-${entry.tid ?? entry.id}`;
+  }
+
+  function topicFromApiEntry(entry) {
+    const id = Number(entry.tid ?? entry.id);
+    const slugPart = topicSlugPart(entry);
+    const slugTitle = readableTitle(slugPart);
+    const title = String(entry.title || slugTitle);
+
+    return {
+      id,
+      title,
+      normalizedTitle: normalizeText(title),
+      slugTitle,
+      normalizedSlugTitle: normalizeText(slugTitle),
+      url: `${location.origin}/topic/${id}/${slugPart}`,
+      lastposttime: Number(entry.lastposttime ?? 0),
+      timestamp: Number(entry.timestamp ?? 0),
+      votes: Number(entry.upvotes ?? entry.votes ?? 0),
+      views: Number(entry.viewcount ?? 0),
+      posts: Number(entry.postcount ?? 0),
+      statsFetchedAt: Date.now(),
+    };
+  }
+
+  async function fetchRecentFeedTopics() {
+    const topics = [];
+
+    for (let start = 0; start < RECENT_FEED_PAGES * 20; start += 20) {
+      const response = await fetch(`/api/recent?start=${start}`, {
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
+        cache: 'no-store',
+      });
+
+      if (!response.ok) break;
+
+      const body = await response.json();
+      for (const entry of body.topics || []) {
+        topics.push(topicFromApiEntry(entry));
+      }
+
+      if (!body.nextStart || (body.topics || []).length < 20) break;
+    }
+
+    return topics;
+  }
+
+  async function fetchCategoryFeedTopics(categoryId) {
+    const topics = [];
+
+    for (let page = 1; page <= SUPPLEMENT_CATEGORY_PAGES; page++) {
+      const response = await fetch(`/api/category/${categoryId}/topics?page=${page}`, {
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
+        cache: 'no-store',
+      });
+
+      if (!response.ok) break;
+
+      const body = await response.json();
+      for (const entry of body.topics || []) {
+        topics.push(topicFromApiEntry(entry));
+      }
+
+      if (!(body.topics || []).length) break;
+    }
+
+    return topics;
+  }
+
+  async function supplementLiveTopics({ rerunSearch = false } = {}) {
+    if (searchState.supplementing) return 0;
+    searchState.supplementing = true;
+
+    try {
+      const batches = await Promise.all([
+        fetchRecentFeedTopics(),
+        ...SUPPLEMENT_CATEGORY_IDS.map((categoryId) => fetchCategoryFeedTopics(categoryId)),
+      ]);
+      const topics = batches.flat();
+
+      if (topics.length) await saveTopics(topics, false);
+      if (rerunSearch && topics.length) runSearch();
+
+      return topics.length;
+    } catch (error) {
+      console.warn('Live topic supplement failed:', error);
+      return 0;
+    } finally {
+      searchState.supplementing = false;
+    }
+  }
+
   function parseTopicSitemap(document) {
     const topics = [];
 
@@ -915,13 +1022,15 @@
 
       const id = Number(match[1]);
       const slug = match[2] || `topic-${id}`;
-      const title = readableTitle(slug);
+      const slugTitle = readableTitle(slug);
       const lastModified = urlNode.querySelector('lastmod')?.textContent.trim() || '';
 
       topics.push({
         id,
-        title,
-        normalizedTitle: normalizeText(title),
+        title: slugTitle,
+        normalizedTitle: normalizeText(slugTitle),
+        slugTitle,
+        normalizedSlugTitle: normalizeText(slugTitle),
         url: `${url.origin}/topic/${id}/${slug}`,
         lastModified,
       });
@@ -933,6 +1042,13 @@
   function setUpdateStatus(message) {
     const status = document.querySelector('.rs-search-update-status');
     if (status) status.textContent = message;
+  }
+
+  function setIndexButtonsDisabled(disabled) {
+    for (const selector of ['.rs-search-update', '.rs-search-rebuild']) {
+      const button = document.querySelector(selector);
+      if (button) button.disabled = disabled;
+    }
   }
 
   function formatResultsStatus() {
@@ -987,10 +1103,21 @@
       );
 
       const batches = await Promise.all(
-        group.map(async (url) => parseTopicSitemap(await fetchXml(url)))
+        group.map(async (url) => {
+          try {
+            return await parseTopicSitemap(await fetchXml(url));
+          } catch (error) {
+            console.warn(`Could not index sitemap ${url}:`, error);
+            return [];
+          }
+        })
       );
 
-      await saveTopics(batches.flat(), false);
+      const topics = batches.flat();
+      if (topics.length) {
+        setUpdateStatus(`Saving ${topics.length.toLocaleString()} topics...`);
+        await saveTopics(topics, false);
+      }
 
       if (completedSitemaps) {
         for (const url of group) completedSitemaps.add(sitemapNumber(url));
@@ -1004,7 +1131,9 @@
   async function updateIndex({ forceFull = false, forceQuick = false } = {}) {
     if (searchState.updating) return;
     searchState.updating = true;
+    setIndexButtonsDisabled(true);
 
+    let succeeded = false;
     const startedAt = Date.now();
 
     try {
@@ -1034,7 +1163,7 @@
         startedAt - lastQuickUpdate >= QUICK_UPDATE_INTERVAL;
 
       if (!quickUpdateDue) {
-        await refreshIndexStatus();
+        succeeded = true;
         return;
       }
 
@@ -1091,7 +1220,10 @@
         });
       }
 
-      await refreshIndexStatus();
+      setUpdateStatus('Checking recent topics...');
+      await supplementLiveTopics();
+
+      succeeded = true;
       runSearch();
     } catch (error) {
       console.error('RipperStore index update failed:', error);
@@ -1101,6 +1233,8 @@
       );
     } finally {
       searchState.updating = false;
+      setIndexButtonsDisabled(false);
+      if (succeeded) await refreshIndexStatus();
     }
   }
 
@@ -1109,14 +1243,27 @@
     return searchState.topics;
   }
 
+  function getSearchableText(topic) {
+    return [...new Set([topic.normalizedTitle, topic.normalizedSlugTitle].filter(Boolean))].join(' ');
+  }
+
+  function textIncludesToken(text, token) {
+    return text.split(' ').includes(token);
+  }
+
   function searchScore(topic, normalizedQuery, tokens) {
+    const searchable = getSearchableText(topic);
     if (String(topic.id) === normalizedQuery) return 1000;
-    if (topic.normalizedTitle === normalizedQuery) return 900;
-    if (topic.normalizedTitle.startsWith(normalizedQuery)) return 700;
-    if (!tokens.every((token) => topic.normalizedTitle.includes(token))) return -1;
+    if (searchable === normalizedQuery) return 900;
+    if (searchable.startsWith(normalizedQuery)) return 700;
+    if (!tokens.every((token) => textIncludesToken(searchable, token))) return -1;
 
     const firstMatch = Math.min(
-      ...tokens.map((token) => topic.normalizedTitle.indexOf(token))
+      ...tokens.map((token) => {
+        const words = searchable.split(' ');
+        const wordIndex = words.indexOf(token);
+        return wordIndex >= 0 ? wordIndex : searchable.indexOf(token);
+      })
     );
     return 500 - firstMatch;
   }
@@ -1129,13 +1276,27 @@
     );
   }
 
-  function getRecencyValue(topic) {
-    if (topic.lastposttime) return topic.lastposttime;
+  function getPostedValue(topic) {
     if (topic.timestamp) return topic.timestamp;
     if (topic.lastModified) {
       const parsed = Date.parse(topic.lastModified);
       if (!Number.isNaN(parsed)) return parsed;
     }
+    return -1;
+  }
+
+  function getLastPostValue(topic) {
+    if (topic.lastposttime) return topic.lastposttime;
+    return -1;
+  }
+
+  function getRecencyValue(topic) {
+    const lastPostMs = getLastPostValue(topic);
+    if (lastPostMs > 0) return lastPostMs;
+
+    const postedMs = getPostedValue(topic);
+    if (postedMs > 0) return postedMs;
+
     return -1;
   }
 
@@ -1245,9 +1406,14 @@
   function topicDetailsText(topic) {
     const parts = [`Topic ${topic.id}`];
 
-    const postedMs = getRecencyValue(topic);
+    const postedMs = getPostedValue(topic);
     if (postedMs > 0) {
       parts.push(`posted ${formatTimeAgo(postedMs)} on ${formatPostedAt(postedMs)}`);
+    }
+
+    const lastPostMs = getLastPostValue(topic);
+    if (lastPostMs > 0 && lastPostMs !== postedMs) {
+      parts.push(`last post ${formatTimeAgo(lastPostMs)} on ${formatPostedAt(lastPostMs)}`);
     }
 
     if (topic.votes != null) parts.push(`${formatCount(topic.votes)} votes`);
@@ -1417,7 +1583,14 @@
     input.focus();
 
     await refreshIndexStatus();
-    if (await topicCount() === 0) updateIndex();
+    if (await topicCount() === 0) {
+      updateIndex();
+      return;
+    }
+
+    supplementLiveTopics({ rerunSearch: true }).then((count) => {
+      if (count) refreshIndexStatus();
+    });
   }
 
   function addSearchInterface() {
