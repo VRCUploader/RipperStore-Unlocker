@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RipperStore Unlocker
 // @namespace    https://forum.ripper.store
-// @version      2.2.0
+// @version      2.3.4
 // @description  Unlocks guest-hidden content and provides private local topic search.
 // @author       VRCUploader Team
 // @match        https://forum.ripper.store/*
@@ -34,7 +34,7 @@
   const FETCH_CONCURRENCY = 4;
   const FETCH_TIMEOUT = 20_000;
   const FETCH_ATTEMPTS = 3;
-  const RESULT_LIMIT = 100;
+  const RESULT_PAGE_SIZE = 50;
 
   const rawPostCache = new Map();
   let revealInProgress = false;
@@ -48,6 +48,10 @@
     updating: false,
     updateTimer: null,
     sortMode: 'relevance',
+    allResults: [],
+    resultScores: new Map(),
+    displayLimit: RESULT_PAGE_SIZE,
+    indexStatus: '',
   };
 
   function addStyles() {
@@ -160,6 +164,8 @@
         background: var(--bs-body-bg, #fff);
         box-shadow: 0 12px 40px rgb(0 0 0 / 35%);
         color: var(--bs-body-color, #212529);
+        display: flex;
+        flex-direction: column;
       }
 
       .rs-search-panel header {
@@ -240,7 +246,8 @@
       }
 
       .rs-search-results {
-        max-height: 62vh;
+        flex: 1;
+        min-height: 0;
         overflow-y: auto;
         border-top: 1px solid rgb(128 128 128 / 25%);
       }
@@ -276,6 +283,35 @@
         margin: 0;
         padding: 24px 16px;
         color: var(--bs-secondary-color, #6c757d);
+        text-align: center;
+      }
+
+      .rs-search-load-more {
+        display: block;
+        width: 100%;
+        margin-top: 8px;
+        padding: 10px 12px;
+        border: 1px solid #adb5bd;
+        border-radius: 6px;
+        background: var(--bs-body-bg, #fff);
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      .rs-search-load-more:hover {
+        background: rgb(13 110 253 / 8%);
+      }
+
+      .rs-search-results-summary {
+        padding: 10px 16px 16px;
+        border-top: 1px solid rgb(128 128 128 / 18%);
+      }
+
+      .rs-search-result-count {
+        margin: 0;
+        color: var(--bs-secondary-color, #6c757d);
+        font-size: .78rem;
         text-align: center;
       }
     `;
@@ -674,12 +710,23 @@
   function mergeTopicRecord(existing, topic) {
     if (!existing) return topic;
 
+    const fromApi = topic.statsFetchedAt != null;
+    const existingFromApi = existing.statsFetchedAt != null;
+
     return {
       ...existing,
       ...topic,
+      title: fromApi
+        ? topic.title
+        : (existingFromApi ? existing.title : (topic.title ?? existing.title)),
+      normalizedTitle: fromApi
+        ? topic.normalizedTitle
+        : (existingFromApi ? existing.normalizedTitle : (topic.normalizedTitle ?? existing.normalizedTitle)),
       votes: topic.votes ?? existing.votes,
       views: topic.views ?? existing.views,
       posts: topic.posts ?? existing.posts,
+      lastposttime: topic.lastposttime ?? existing.lastposttime,
+      timestamp: topic.timestamp ?? existing.timestamp,
       statsFetchedAt: topic.statsFetchedAt ?? existing.statsFetchedAt,
     };
   }
@@ -714,6 +761,7 @@
 
   function needsStats(topic) {
     if (topic.votes == null || topic.views == null || topic.posts == null) return true;
+    if (topic.lastposttime == null) return true;
     if (!topic.statsFetchedAt) return true;
     return Date.now() - topic.statsFetchedAt >= STATS_REFRESH_INTERVAL;
   }
@@ -733,11 +781,16 @@
     }
 
     const data = body.response ?? body;
+    const title = String(data.title || topic.title || '');
     return {
       id: topic.id,
+      title,
+      normalizedTitle: normalizeText(title),
       votes: Number(data.votes ?? data.upvotes ?? 0),
       views: Number(data.viewcount ?? 0),
       posts: Number(data.postcount ?? 0),
+      lastposttime: Number(data.lastposttime ?? data.timestamp ?? 0),
+      timestamp: Number(data.timestamp ?? 0),
       statsFetchedAt: Date.now(),
     };
   }
@@ -880,6 +933,40 @@
   function setUpdateStatus(message) {
     const status = document.querySelector('.rs-search-update-status');
     if (status) status.textContent = message;
+  }
+
+  function formatResultsStatus() {
+    const query = document.querySelector('.rs-search-input')?.value.trim();
+    if (!query) return '';
+
+    const total = searchState.allResults.length;
+    const showing = getDisplayedResults().length;
+
+    if (total === 0) return 'No results';
+    if (total > showing) {
+      return `Showing ${showing.toLocaleString()} of ${total.toLocaleString()} results`;
+    }
+    return total === 1
+      ? 'Showing 1 result'
+      : `Showing all ${total.toLocaleString()} results`;
+  }
+
+  function updateToolbarStatus() {
+    if (searchState.updating) return;
+
+    const status = document.querySelector('.rs-search-update-status');
+    if (!status) return;
+
+    const parts = [searchState.indexStatus].filter(Boolean);
+    const resultsStatus = formatResultsStatus();
+    if (resultsStatus) parts.push(resultsStatus);
+
+    status.textContent = parts.join(' · ');
+  }
+
+  function setIndexStatus(message) {
+    searchState.indexStatus = message;
+    updateToolbarStatus();
   }
 
   async function loadSitemapList() {
@@ -1042,10 +1129,26 @@
     );
   }
 
+  function getRecencyValue(topic) {
+    if (topic.lastposttime) return topic.lastposttime;
+    if (topic.timestamp) return topic.timestamp;
+    if (topic.lastModified) {
+      const parsed = Date.parse(topic.lastModified);
+      if (!Number.isNaN(parsed)) return parsed;
+    }
+    return -1;
+  }
+
+  function getSortValue(topic, mode) {
+    if (mode === 'lastposttime') return getRecencyValue(topic);
+    if (mode === 'relevance') return null;
+    return topic[mode] ?? -1;
+  }
+
   function compareTopics(a, b, mode) {
     if (mode !== 'relevance') {
-      const left = a.topic[mode] ?? -1;
-      const right = b.topic[mode] ?? -1;
+      const left = getSortValue(a.topic, mode);
+      const right = getSortValue(b.topic, mode);
       if (right !== left) return right - left;
     }
 
@@ -1055,8 +1158,8 @@
   function sortTopicList(topics, scores, mode = getSortMode()) {
     return [...topics].sort((left, right) => {
       if (mode !== 'relevance') {
-        const leftValue = left[mode] ?? -1;
-        const rightValue = right[mode] ?? -1;
+        const leftValue = getSortValue(left, mode);
+        const rightValue = getSortValue(right, mode);
         if (rightValue !== leftValue) return rightValue - leftValue;
       }
 
@@ -1081,8 +1184,7 @@
         score: searchScore(topic, normalizedQuery, tokens),
       }))
       .filter((result) => result.score >= 0)
-      .sort((a, b) => compareTopics(a, b, mode))
-      .slice(0, RESULT_LIMIT);
+      .sort((a, b) => compareTopics(a, b, mode));
 
     const scores = new Map(
       matches.map((result) => [result.topic.id, result.score])
@@ -1094,18 +1196,84 @@
     };
   }
 
+  function getDisplayedResults() {
+    return searchState.allResults.slice(0, searchState.displayLimit);
+  }
+
   function formatCount(value) {
     return Number(value || 0).toLocaleString();
   }
 
+  function formatTimeAgo(timestampMs) {
+    const seconds = Math.floor((Date.now() - timestampMs) / 1000);
+    if (seconds < 45) return 'just now';
+
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) {
+      return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+    }
+
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) {
+      return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+    }
+
+    const days = Math.floor(hours / 24);
+    if (days < 30) {
+      return `${days} day${days === 1 ? '' : 's'} ago`;
+    }
+
+    const months = Math.floor(days / 30);
+    if (months < 12) {
+      return `${months} month${months === 1 ? '' : 's'} ago`;
+    }
+
+    const years = Math.floor(days / 365);
+    return `${years} year${years === 1 ? '' : 's'} ago`;
+  }
+
+  function formatPostedAt(timestampMs) {
+    return new Date(timestampMs).toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  }
+
   function topicDetailsText(topic) {
     const parts = [`Topic ${topic.id}`];
+
+    const postedMs = getRecencyValue(topic);
+    if (postedMs > 0) {
+      parts.push(`posted ${formatTimeAgo(postedMs)} on ${formatPostedAt(postedMs)}`);
+    }
 
     if (topic.votes != null) parts.push(`${formatCount(topic.votes)} votes`);
     if (topic.views != null) parts.push(`${formatCount(topic.views)} views`);
     if (topic.posts != null) parts.push(`${formatCount(topic.posts)} posts`);
 
     return parts;
+  }
+
+  function appendResultsSummary(results, topics, query) {
+    if (!query.trim() || !topics.length) return;
+
+    const total = searchState.allResults.length;
+    const showing = topics.length;
+    if (total <= showing) return;
+
+    const summary = document.createElement('div');
+    summary.className = 'rs-search-results-summary';
+
+    const loadMore = document.createElement('button');
+    loadMore.type = 'button';
+    loadMore.className = 'rs-search-load-more';
+    loadMore.textContent = `Load ${Math.min(RESULT_PAGE_SIZE, total - showing).toLocaleString()} more`;
+    loadMore.addEventListener('click', loadMoreResults);
+    summary.append(loadMore);
+    results.append(summary);
   }
 
   function renderResults(topics, query) {
@@ -1118,6 +1286,7 @@
       message.className = 'rs-search-empty';
       message.textContent = 'Search public topic titles.';
       results.append(message);
+      updateToolbarStatus();
       return;
     }
 
@@ -1126,6 +1295,7 @@
       message.className = 'rs-search-empty';
       message.textContent = 'No matching topics found.';
       results.append(message);
+      updateToolbarStatus();
       return;
     }
 
@@ -1150,6 +1320,44 @@
       link.append(title, details);
       results.append(link);
     }
+
+    appendResultsSummary(results, topics, query);
+    updateToolbarStatus();
+  }
+
+  async function enrichAndRenderResults(query) {
+    const mode = getSortMode();
+    const toEnrich = mode === 'relevance'
+      ? getDisplayedResults()
+      : searchState.allResults;
+
+    await enrichTopicStats(toEnrich);
+
+    const input = document.querySelector('.rs-search-input');
+    if (!input || input.value !== query) return;
+
+    if (mode !== 'relevance') {
+      searchState.allResults = sortTopicList(searchState.allResults, searchState.resultScores);
+    }
+
+    renderResults(getDisplayedResults(), query);
+  }
+
+  async function loadMoreResults() {
+    const input = document.querySelector('.rs-search-input');
+    if (!input) return;
+
+    const query = input.value;
+    if (!query.trim()) return;
+
+    const previousCount = searchState.displayLimit;
+    searchState.displayLimit += RESULT_PAGE_SIZE;
+    renderResults(getDisplayedResults(), query);
+
+    if (getSortMode() !== 'relevance') return;
+
+    const newlyVisible = searchState.allResults.slice(previousCount, searchState.displayLimit);
+    if (newlyVisible.length) await enrichAndRenderResults(query);
   }
 
   async function runSearch() {
@@ -1158,6 +1366,9 @@
 
     const query = input.value;
     if (!query.trim()) {
+      searchState.allResults = [];
+      searchState.resultScores = new Map();
+      searchState.displayLimit = RESULT_PAGE_SIZE;
       renderResults([], query);
       return;
     }
@@ -1165,12 +1376,12 @@
     const { topics, scores } = await searchTopics(query);
     if (input.value !== query) return;
 
-    renderResults(topics, query);
-    await enrichTopicStats(topics);
-    if (input.value !== query) return;
+    searchState.allResults = topics;
+    searchState.resultScores = scores;
+    searchState.displayLimit = RESULT_PAGE_SIZE;
 
-    const sorted = sortTopicList(topics, scores);
-    renderResults(sorted, query);
+    renderResults(getDisplayedResults(), query);
+    await enrichAndRenderResults(query);
   }
 
   function scheduleSearch() {
@@ -1185,12 +1396,12 @@
     ]);
 
     if (!count) {
-      setUpdateStatus('The local index has not been built yet.');
+      setIndexStatus('The local index has not been built yet.');
       return;
     }
 
     const updated = new Date(lastQuickUpdate).toLocaleString();
-    setUpdateStatus(`${count.toLocaleString()} topics. Updated ${updated}.`);
+    setIndexStatus(`${count.toLocaleString()} topics. Updated ${updated}.`);
   }
 
   function closeSearch() {
@@ -1235,6 +1446,7 @@
               Sort
               <select class="rs-search-sort-select" title="Sort search results">
                 <option value="relevance">Relevance</option>
+                <option value="lastposttime">Recent</option>
                 <option value="votes">Votes</option>
                 <option value="views">Views</option>
                 <option value="posts">Posts</option>
