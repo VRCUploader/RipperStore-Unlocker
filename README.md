@@ -1,3 +1,7 @@
+# Archived
+Due to a large databreach of IPs on ripper.store and the security patches that followed, api access is now restricted for guest users. So this script will no longer work. Sorry everyone :(
+
+
 # Ripper Store Unlocker
 
 (this readme is probably longer than it needs to be but oh well)
